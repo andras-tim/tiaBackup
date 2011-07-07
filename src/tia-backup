@@ -1,0 +1,349 @@
+#!/bin/bash
+
+RSYNC_OPTIONS='--inplace --ignore-errors --delete --delete-excluded --numeric-ids --archive --perms --hard-links --links'
+LOG_TIME_FORMAT='%Y.%m.%d %H:%M:%S'
+
+######
+# FUNCTIONS
+#
+function ERROR()
+{
+    echo "ERROR: $1"
+    abort
+}
+
+function session_echo()
+{
+    echo "### Session $1: `date "+${LOG_TIME_FORMAT}"`"
+}
+
+function abort()
+{
+    echo
+    session_echo 'aborted'
+    if [ $# -gt 0 ]; then
+	exit $1
+    else
+	exit 1
+    fi
+}
+
+function disp_param()
+{
+    if [ "$1" == '' ]
+    then
+	echo '-'
+    else
+	echo "$1" | tr '\n' ' '
+    fi
+}
+
+function notify()
+{
+    for ((i=$1;i<$2;i++))
+    do
+        beep -l 30 -f 500
+        sleep 0.015
+    done
+}
+
+function bu_folders()
+{
+    find "$DEST" -mindepth 1 -maxdepth 1 -type d -name '[0-9_]*' | sort
+}
+
+function lcount()
+{
+    if [ "$1" == '' ]
+    then
+	echo 0
+    else
+	echo "$1" | wc -l
+    fi
+}
+
+function rotate2int()
+{
+    range="`echo "$1" | cut -f1 -d':'`"
+    keep="`echo "$1" | cut -f2 -d':'`"
+    
+    # Precheck parameters
+    if [ "$range" == '' ] || [ "$keep" == '' ] || echo "$keep" | grep -q '[[:alpha:]]'
+    then
+	echo 'bad'
+	return
+    fi
+
+    # Check and replace range
+    case "${range,,}" in
+	100year)    range=2;;
+	10year)     range=3;;
+        year)       range=4;;
+	10month)    range=5;;
+        month)      range=6;;
+	10day)      range=7;;
+        day)        range=8;;
+	10hour)     range=10;;
+        hour)       range=11;;
+	10min)      range=12;;
+        min)        range=13;;
+	*)          if echo "$range" | grep -q '[[:alpha:]]' || [ $range -lt 1 ]
+                    then
+			echo 'bad'
+			return
+	            fi;;
+    esac
+    if [ $range -gt ${#TS} ]
+    then
+	echo 'bad'
+        return
+    fi
+
+    # Check keep count
+    if [ $keep -lt 0 ]
+    then
+	echo 'bad'
+	return
+    fi
+   
+    # Return correct values 
+    echo "${range}:${keep}"
+}
+
+#1: available backups   2: selected index   3: keep in range
+function rotateFilter()
+{
+    {
+        # Keep if the date equal with partial date of now (e.g. now=20101128, selIndex=6 >> keep: 201011xx)
+        echo "$1" | grep "^${TS:0:$2}"
+
+        # Get the remained items
+        remained="`echo "$1" | grep -v "^${TS:0:$2}"`"
+        if [ ! "$remained" == '' ]
+        then
+            # Truncate index length the remained items and select one
+            oneOf="`echo "$remained" | sed "s>\(.\{$2\}\).*>\1>g" | uniq`"
+
+            # Keep 3. param piece of remained items each 'oneOf'
+            echo "$oneOf" | while read a
+            do
+               echo "$remained" | grep "^$a" | tail -n $3
+            done
+        fi
+    } | sort
+}
+
+
+######
+# EXPLAIN PARAMETERS
+#
+# Check params count
+if [ $# -lt 1 ]
+then
+    ERROR 'Missing backup profile file or folder'
+fi
+
+# Check params exist
+if [ ! -e "$1" ]
+then
+    ERROR 'Selected path is not exist'
+fi
+
+# Check param type and start recursive if path is a folder
+if [ -d "$1" ]
+then
+    # Get profile list
+    profiles="`find "$1" -mindepth 1 -type f -readable | sort`"
+    [ "x$profiles" == 'x' ] && abort 1
+    profile_count=$(echo "$profiles" | wc -l)
+
+    # Create error status temp file
+    errTmpFile="/tmp/tia-backup_`echo "$1" | md5sum - | cut -f1 -d' '`"
+    touch "${errTmpFile}" || abort $?
+
+    # Processing list
+    ret=0
+    pi=0
+    echo "$profiles" | while read a
+    do
+        echo -e "\n[ $[$pi+1] / ${profile_count} ] "
+        notify $pi ${profile_count} &
+	pi=$[$pi+1]
+	"$0" "$a" || ret=$?
+	if [ $ret -gt 0 ]; then
+            echo ERR: $ret
+            echo -e "$ret\t$a" >> "${errTmpFile}"
+        fi
+    done
+    
+    # Exit
+    exitCode=`wc -l "${errTmpFile}" | cut -f1 -d' '`
+    echo -e "\n### Processed $pi profile"
+    rm "${errTmpFile}"
+    exit $exitCode
+fi
+
+######
+# LOAD PROFILE
+#
+session_echo 'started'
+echo -en "\nLoading profile: $1... "
+
+# Init variables of settings
+TSTAMP='%Y%m%d_%H%M'
+SOURCE=
+DEST=
+EXCLUDE=
+OPTIONS=
+ROTATES=
+
+# Set keywords
+KW_PNAME="`echo "$1" | sed 's>.*/>>g'`"
+
+# Source profile
+currDir="`pwd`"
+source "$1" || ERROR "Profile initialization error: $1"
+cd "$currDir"
+
+# Set timestamp
+TS="`date +${TSTAMP}`" || ERROR "Bad timestamp format: $TSTAMP"
+
+# Check SOURCE
+[ "${SOURCE}" == '' ] && ERROR "Missing SOURCE parameter in profile: $1"
+[ ! -e "${SOURCE}" ] && ERROR "SOURCE path is not exist"
+SOURCE="`cd "$SOURCE"; pwd`"
+
+# Check DEST
+[ "${DEST}" == '' ] && ERROR "Missing DEST parameter in profile: $1"
+mkdir -p "${DEST}"
+[ ! -e "${DEST}" ] && ERROR "DEST path is not exist"
+DEST="`cd "$DEST"; pwd`"
+
+# Check ROTATE parameter
+TMP_ROTATES=
+for i in ${ROTATES}
+do
+    ret=`rotate2int $i`
+    if [ "$ret" == 'bad' ]
+    then
+	ERROR "Bad ROTATES parameter: $i"
+    fi
+    TMP_ROTATES="${TMP_ROTATES}${ret}#"
+done
+# Clean trailing line reak then sort lines
+ROTATES="`echo "$TMP_ROTATES" | tr '#' '\n' | grep -v '^$' | sort -rn`"
+
+# Print parameters
+cat - << VEGE
+Ok
+    TSTAMP:   $TSTAMP
+    SOURCE:   $SOURCE
+    DEST:     $DEST
+    EXCLUDE:  `disp_param "$EXCLUDE"`
+    OPTIONS:  `disp_param "$OPTIONS"`
+    ROTATES:  `disp_param "$ROTATES"`
+VEGE
+echo
+
+
+######
+# BACKUP
+#
+# Check other instance on destination
+if [ `ps ax | grep rsync | grep "$DEST/inprogress"` ]
+then
+    ERROR "Other instance is in progress on destination folder: $DEST"
+fi
+
+# Check destination folder
+if [ -e "$DEST/$TS" ]
+then
+    ERROR "Backup folder's existed: $DEST/$TS"
+fi
+
+# Remove previous inprogress folder is exists (workaround)
+if [ -e "$DEST/inprogress" ]
+then
+    echo -n 'Remove previous inprogress folder... '
+    if rm -rf "$DEST/inprogress"
+    then
+	echo 'Ok'
+    else
+	ERROR "Can't remove previous inprogress folder: $DEST/inprogress"
+    fi
+fi
+
+echo -n 'Performing backup... '
+# Generate exclude parameter chain
+EX=
+for i in ${EXCLUDE}; do
+    EX="$EX --exclude $i "
+done
+
+# Use link path if available
+LINK=
+backups="`bu_folders`"
+if [ ! "$backups" == '' ]; then
+    LINK="--link-dest=`echo "$backups" | tail -n 1`/"
+fi
+
+# Run Backup
+cmd="rsync ${RSYNC_OPTIONS}"
+cmd="$cmd $OPTIONS $LINK $EX $SOURCE/. $DEST/inprogress/"
+$cmd
+ret=$?
+
+# Handle return codes
+case $ret in
+    0|23|24)	mv "$DEST/inprogress" "$DEST/$TS" || abort $?
+		echo -e 'Done\n'
+		;;
+    *)		ERROR "rsync (err: $ret)"
+		abort $ret
+		;;
+esac
+
+# Copy current profile to backup
+cp "$1" "$DEST/$TS/.backup_profile"
+
+
+######
+# BACKUP ROTATE
+#
+echo -n 'Initialize backup rotation... '
+# Get backup folders
+backups="`bu_folders | sed "s>^$DEST/>>g"`"
+echo -n "`lcount "$backups"` backups... "
+
+# Get keeped folders
+keep_backups="$backups"
+for r in $ROTATES
+do
+    range="`echo "$r" | cut -f1 -d':'`"
+    keep="`echo "$r" | cut -f2 -d':'`"
+    tmp="`rotateFilter "${keep_backups}" $range $keep`"
+    keep_backups="$tmp"
+done
+
+# Invert folder list
+kbf="`tempfile`"
+echo "${keep_backups}" > "$kbf"
+rm_backups="`echo "$backups" | grep -vxf "$kbf"`"
+rm "$kbf"
+rm_count=`lcount "$rm_backups"`
+echo "${rm_count} will remove"
+
+# Remove old backups
+if [ ${rm_count} -gt 0 ]; then
+    echo -n 'Remove outrotated backups... '
+    echo "${rm_backups}" | while read i
+    do
+	echo -n "$i "
+	rm "$DEST/$i" -rf
+    done
+    echo
+fi
+
+echo
+session_echo 'successfully end'
+exit 0

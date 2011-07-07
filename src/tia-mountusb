@@ -1,0 +1,33 @@
+#!/bin/bash
+MOUNT_PROFILES='/etc/tia-backup/mountusb.d'
+BEEP_LENGHT=100
+
+function notify()
+{
+    [ ${BEEP_LENGHT} -ne 0 ] && beep -f $1 -l ${BEEP_LENGHT}; beep -f $2 -l ${BEEP_LENGHT}
+}
+
+# Exit if is not a disk ID
+echo "$1" | grep -qE '^sd[a-z][0-9]+' || exit 0
+
+# Get UUID of disk
+uuid="`blkid /dev/$1 | cut -d'"' -f2`"
+[ "x$uuid" == 'x' ] && exit 1
+
+# Run script
+tmpOut="/tmp/tia-mountusb_$uuid"
+ret=0
+if [ -e "${MOUNT_PROFILES}/${uuid}" ]
+then
+    notify 400 600
+    sleep 2
+    "${MOUNT_PROFILES}/${uuid}" &> "$tmpOut"; ret=$?
+    if [ $ret -eq 0 ]
+    then
+        notify 600 400
+    else
+        beep; beep; beep
+    fi
+    sleep 2
+fi
+exit $ret
